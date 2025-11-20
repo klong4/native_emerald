@@ -583,10 +583,23 @@ static u32 execute_arm(ARM7TDMI *cpu, Memory *mem, u32 opcode) {
                 break;
                 
             case 0x02: // Halt
+                cpu->halted = true;
+                break;
+                
             case 0x03: // Stop
+                cpu->halted = true;
+                break;
+                
             case 0x04: // IntrWait
+                // r0 = discard old flags (0=check, 1=discard)
+                // r1 = interrupt mask
+                // Halt CPU until interrupt in mask occurs
+                cpu->halted = true;
+                break;
+                
             case 0x05: // VBlankIntrWait
-                // Just continue for now
+                // Wait for VBlank interrupt
+                cpu->halted = true;
                 break;
                 
             case 0x06: // Div

@@ -17,6 +17,9 @@ typedef struct {
     InterruptState interrupts;
     u64 frame_count;
     bool running;
+    u32 vram_writes;
+    u32 oam_writes;
+    u32 interrupts_fired;
 } EmulatorState;
 
 static void emu_init(EmulatorState *emu, u8 *rom, u32 rom_size) {
@@ -36,6 +39,9 @@ static void emu_init(EmulatorState *emu, u8 *rom, u32 rom_size) {
     
     emu->frame_count = 0;
     emu->running = true;
+    emu->vram_writes = 0;
+    emu->oam_writes = 0;
+    emu->interrupts_fired = 0;
     
     printf("Emulator initialized!\n");
     printf("Entry point: 0x%08X\n", emu->cpu.r[15]);
@@ -47,6 +53,10 @@ static void emu_frame(EmulatorState *emu) {
     // Update input from AI or keyboard
     input_update(&emu->input, &emu->memory);
     
+    // Track VRAM/OAM writes before frame
+    u32 vram_before = emu->vram_writes;
+    u32 oam_before = emu->oam_writes;
+    
     // Execute one frame worth of CPU instructions
     // The CPU will check for interrupts during execution
     cpu_execute_frame(&emu->cpu, &emu->memory, &emu->interrupts);
@@ -54,6 +64,9 @@ static void emu_frame(EmulatorState *emu) {
     // Update interrupt state for VBlank
     // VBlank occurs at scanline 160
     interrupt_update_vcount(&emu->interrupts, 160);
+    if (emu->interrupts.if_flag & INT_VBLANK) {
+        emu->interrupts_fired++;
+    }
     
     // Render graphics
     gfx_render_frame(&emu->gfx, &emu->memory);
@@ -174,8 +187,13 @@ int main(int argc, char **argv) {
         
         // Print status every 60 frames
         if (emu.frame_count % 60 == 0) {
-            printf("Frame %llu, AI Input: 0x%02X\n",
+            printf("Frame %llu | PC=0x%08X | IE=0x%04X IF=0x%04X IME=%d | Ints=%u | Input=0x%02X\n",
                    (unsigned long long)emu.frame_count,
+                   emu.cpu.r[15],
+                   emu.interrupts.ie,
+                   emu.interrupts.if_flag,
+                   emu.interrupts.ime,
+                   emu.interrupts_fired,
                    mem_get_ai_input(&emu.memory));
         }
     }
