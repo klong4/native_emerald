@@ -743,6 +743,67 @@ static u32 execute_arm(ARM7TDMI *cpu, Memory *mem, u32 opcode) {
         return 3;
     }
     
+    // MRS - Move PSR to register
+    if ((opcode & 0x0FBF0FFF) == 0x010F0000) {
+        u32 rd = ARM_RD(opcode);
+        bool spsr = opcode & (1 << 22);
+        
+        if (spsr) {
+            // SPSR not implemented yet - use CPSR
+            cpu->r[rd] = cpu->cpsr;
+        } else {
+            cpu->r[rd] = cpu->cpsr;
+        }
+        return 1;
+    }
+    
+    // MSR - Move register to PSR
+    if (((opcode & 0x0FB00000) == 0x03200000) || ((opcode & 0x0DB00000) == 0x01200000)) {
+        bool immediate = opcode & (1 << 25);
+        bool spsr = opcode & (1 << 22);
+        u32 field_mask = 0;
+        
+        if (opcode & (1 << 16)) field_mask |= 0x000000FF; // Control field
+        if (opcode & (1 << 17)) field_mask |= 0x0000FF00; // Extension field
+        if (opcode & (1 << 18)) field_mask |= 0x00FF0000; // Status field
+        if (opcode & (1 << 19)) field_mask |= 0xFF000000; // Flags field
+        
+        u32 value;
+        if (immediate) {
+            u32 imm = ARM_IMM(opcode);
+            u32 rotate = ARM_ROTATE(opcode) * 2;
+            value = (imm >> rotate) | (imm << (32 - rotate));
+        } else {
+            value = cpu->r[ARM_RM(opcode)];
+        }
+        
+        if (spsr) {
+            // SPSR not implemented - ignore
+        } else {
+            cpu->cpsr = (cpu->cpsr & ~field_mask) | (value & field_mask);
+        }
+        return 1;
+    }
+    
+    // Coprocessor instructions - stub them out
+    // CDP - Coprocessor data processing
+    if ((opcode & 0x0F000010) == 0x0E000000) {
+        // Ignore coprocessor operations
+        return 1;
+    }
+    
+    // LDC/STC - Coprocessor load/store
+    if ((opcode & 0x0E000000) == 0x0C000000) {
+        // Ignore coprocessor transfers
+        return 1;
+    }
+    
+    // MCR/MRC - Coprocessor register transfer
+    if ((opcode & 0x0F000010) == 0x0E000010) {
+        // Ignore coprocessor register transfers
+        return 1;
+    }
+    
     // Unimplemented instruction
     return 1;
 }
