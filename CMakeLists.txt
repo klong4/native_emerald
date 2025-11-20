@@ -69,6 +69,7 @@ set(SOURCES
     gfx_renderer.c
     input.c
     stubs.c
+    interrupts.c
 )
 
 set(HEADERS
@@ -78,6 +79,7 @@ set(HEADERS
     gfx_renderer.h
     input.h
     stubs.h
+    interrupts.h
     types.h
 )
 

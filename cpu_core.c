@@ -1,5 +1,6 @@
 #include "cpu_core.h"
 #include "memory.h"
+#include "interrupts.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1285,13 +1286,47 @@ u32 cpu_step(ARM7TDMI *cpu, Memory *mem) {
     }
 }
 
-void cpu_execute_frame(ARM7TDMI *cpu, Memory *mem) {
+void cpu_handle_interrupt(ARM7TDMI *cpu, Memory *mem) {
+    // Check if IRQ is disabled in CPSR
+    if (cpu->cpsr & FLAG_I) return;
+    
+    // Save current CPSR to SPSR_irq
+    cpu->spsr = cpu->cpsr;
+    
+    // Switch to IRQ mode and disable IRQ
+    cpu->cpsr = (cpu->cpsr & 0xFFFFFFE0) | 0x12; // IRQ mode
+    cpu->cpsr |= FLAG_I; // Disable IRQ
+    
+    // Save return address in LR_irq (current PC + 4)
+    cpu->r[14] = cpu->r[15] + 4;
+    
+    // Set PC to IRQ vector (0x00000018)
+    cpu->r[15] = 0x00000018;
+    cpu->thumb_mode = false;
+    
+    // Clear halted state
+    cpu->halted = false;
+}
+
+void cpu_execute_frame(ARM7TDMI *cpu, Memory *mem, InterruptState *interrupts) {
     // GBA runs at ~16.78 MHz
     // At 60 FPS, that's ~280,000 cycles per frame
     const u32 CYCLES_PER_FRAME = 280000;
     
     u32 cycles_executed = 0;
-    while (cycles_executed < CYCLES_PER_FRAME && !cpu->halted) {
+    while (cycles_executed < CYCLES_PER_FRAME) {
+        // Check for interrupts before each instruction
+        if (interrupts && interrupt_check(interrupts)) {
+            cpu_handle_interrupt(cpu, mem);
+        }
+        
+        if (cpu->halted) {
+            // If halted, just burn cycles until interrupt
+            cycles_executed += 1;
+            cpu->cycles += 1;
+            continue;
+        }
+        
         u32 cycles = cpu_step(cpu, mem);
         cycles_executed += cycles;
         cpu->cycles += cycles;

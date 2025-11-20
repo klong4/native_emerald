@@ -3,6 +3,9 @@
 
 #include "types.h"
 
+// Forward declaration
+typedef struct InterruptState InterruptState;
+
 typedef struct {
     u8 *rom;              // ROM data (loaded from file)
     u32 rom_size;         // Actual ROM size
@@ -12,12 +15,14 @@ typedef struct {
     u8 oam[OAM_SIZE];     // Object Attribute Memory (1KB)
     u8 palette[PALETTE_SIZE]; // Palette RAM (1KB)
     u8 io_regs[IO_SIZE];  // I/O Registers (1KB)
+    InterruptState *interrupts; // Pointer to interrupt state
 } Memory;
 
 // Initialize memory subsystem
 void mem_init(Memory *mem);
 void mem_cleanup(Memory *mem);
 void mem_set_rom(Memory *mem, u8 *rom, u32 size);
+void mem_set_interrupts(Memory *mem, InterruptState *interrupts);
 
 // Memory access functions
 u32 mem_read32(Memory *mem, u32 addr);

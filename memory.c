@@ -1,4 +1,5 @@
 #include "memory.h"
+#include "interrupts.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,7 @@ void mem_init(Memory *mem) {
     
     mem->rom = NULL;
     mem->rom_size = 0;
+    mem->interrupts = NULL;
     
     memset(mem->ewram, 0, EWRAM_SIZE);
     memset(mem->iwram, 0, IWRAM_SIZE);
@@ -31,6 +33,10 @@ void mem_set_rom(Memory *mem, u8 *rom, u32 size) {
     mem->rom_size = size;
 }
 
+void mem_set_interrupts(Memory *mem, InterruptState *interrupts) {
+    mem->interrupts = interrupts;
+}
+
 u8 mem_read8(Memory *mem, u32 addr) {
     // EWRAM: 0x02000000 - 0x0203FFFF (256KB)
     if (addr >= ADDR_EWRAM_START && addr < ADDR_EWRAM_START + EWRAM_SIZE) {
@@ -44,7 +50,28 @@ u8 mem_read8(Memory *mem, u32 addr) {
     
     // I/O Registers: 0x04000000 - 0x040003FF (1KB)
     if (addr >= ADDR_IO_START && addr < ADDR_IO_START + IO_SIZE) {
-        return mem->io_regs[addr - ADDR_IO_START];
+        u32 offset = addr - ADDR_IO_START;
+        
+        // Return live interrupt register values
+        if (mem->interrupts) {
+            if (offset == REG_IE || offset == REG_IE + 1) {
+                return (offset == REG_IE) ? (mem->interrupts->ie & 0xFF) : ((mem->interrupts->ie >> 8) & 0xFF);
+            }
+            if (offset == REG_IF || offset == REG_IF + 1) {
+                return (offset == REG_IF) ? (mem->interrupts->if_flag & 0xFF) : ((mem->interrupts->if_flag >> 8) & 0xFF);
+            }
+            if (offset == REG_IME || offset == REG_IME + 1) {
+                return (offset == REG_IME) ? (mem->interrupts->ime & 0xFF) : ((mem->interrupts->ime >> 8) & 0xFF);
+            }
+            if (offset == 0x04 || offset == 0x05) {
+                return (offset == 0x04) ? (mem->interrupts->dispstat & 0xFF) : ((mem->interrupts->dispstat >> 8) & 0xFF);
+            }
+            if (offset == 0x06 || offset == 0x07) {
+                return (offset == 0x06) ? (mem->interrupts->vcount & 0xFF) : ((mem->interrupts->vcount >> 8) & 0xFF);
+            }
+        }
+        
+        return mem->io_regs[offset];
     }
     
     // Palette RAM: 0x05000000 - 0x050003FF (1KB)
@@ -114,7 +141,64 @@ void mem_write8(Memory *mem, u32 addr, u8 value) {
     
     // I/O Registers: 0x04000000 - 0x040003FF
     if (addr >= ADDR_IO_START && addr < ADDR_IO_START + IO_SIZE) {
-        mem->io_regs[addr - ADDR_IO_START] = value;
+        u32 offset = addr - ADDR_IO_START;
+        
+        // Handle interrupt registers specially
+        if (mem->interrupts) {
+            if (offset == REG_IE || offset == REG_IE + 1) {
+                // IE register write
+                u16 ie = mem_read16(mem, ADDR_IO_START + REG_IE);
+                if (offset == REG_IE) {
+                    ie = (ie & 0xFF00) | value;
+                } else {
+                    ie = (ie & 0x00FF) | (value << 8);
+                }
+                mem->interrupts->ie = ie;
+                mem->io_regs[REG_IE] = ie & 0xFF;
+                mem->io_regs[REG_IE + 1] = (ie >> 8) & 0xFF;
+                return;
+            }
+            if (offset == REG_IF || offset == REG_IF + 1) {
+                // IF register write (acknowledge interrupts)
+                u16 if_val = mem_read16(mem, ADDR_IO_START + REG_IF);
+                if (offset == REG_IF) {
+                    interrupt_acknowledge(mem->interrupts, value);
+                } else {
+                    interrupt_acknowledge(mem->interrupts, value << 8);
+                }
+                mem->io_regs[REG_IF] = mem->interrupts->if_flag & 0xFF;
+                mem->io_regs[REG_IF + 1] = (mem->interrupts->if_flag >> 8) & 0xFF;
+                return;
+            }
+            if (offset == REG_IME || offset == REG_IME + 1) {
+                // IME register write
+                u16 ime = mem_read16(mem, ADDR_IO_START + REG_IME);
+                if (offset == REG_IME) {
+                    ime = (ime & 0xFF00) | value;
+                } else {
+                    ime = (ime & 0x00FF) | (value << 8);
+                }
+                mem->interrupts->ime = ime;
+                mem->io_regs[REG_IME] = ime & 0xFF;
+                mem->io_regs[REG_IME + 1] = (ime >> 8) & 0xFF;
+                return;
+            }
+            if (offset == 0x04 || offset == 0x05) {
+                // DISPSTAT register
+                u16 dispstat = mem_read16(mem, ADDR_IO_START + 0x04);
+                if (offset == 0x04) {
+                    dispstat = (dispstat & 0xFF00) | value;
+                } else {
+                    dispstat = (dispstat & 0x00FF) | (value << 8);
+                }
+                mem->interrupts->dispstat = dispstat;
+                mem->io_regs[0x04] = dispstat & 0xFF;
+                mem->io_regs[0x05] = (dispstat >> 8) & 0xFF;
+                return;
+            }
+        }
+        
+        mem->io_regs[offset] = value;
         return;
     }
     

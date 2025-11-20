@@ -7,12 +7,14 @@
 #include "gfx_renderer.h"
 #include "input.h"
 #include "stubs.h"
+#include "interrupts.h"
 
 typedef struct {
     ARM7TDMI cpu;
     Memory memory;
     GFXState gfx;
     InputState input;
+    InterruptState interrupts;
     u64 frame_count;
     bool running;
 } EmulatorState;
@@ -21,6 +23,8 @@ static void emu_init(EmulatorState *emu, u8 *rom, u32 rom_size) {
     cpu_init(&emu->cpu);
     mem_init(&emu->memory);
     mem_set_rom(&emu->memory, rom, rom_size);
+    interrupt_init(&emu->interrupts);
+    mem_set_interrupts(&emu->memory, &emu->interrupts);
     gfx_init(&emu->gfx);
     input_init(&emu->input);
     
@@ -44,7 +48,12 @@ static void emu_frame(EmulatorState *emu) {
     input_update(&emu->input, &emu->memory);
     
     // Execute one frame worth of CPU instructions
-    cpu_execute_frame(&emu->cpu, &emu->memory);
+    // The CPU will check for interrupts during execution
+    cpu_execute_frame(&emu->cpu, &emu->memory, &emu->interrupts);
+    
+    // Update interrupt state for VBlank
+    // VBlank occurs at scanline 160
+    interrupt_update_vcount(&emu->interrupts, 160);
     
     // Render graphics
     gfx_render_frame(&emu->gfx, &emu->memory);
