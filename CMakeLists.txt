@@ -70,6 +70,7 @@ set(SOURCES
     input.c
     stubs.c
     interrupts.c
+    python_api.c
 )
 
 set(HEADERS
@@ -81,6 +82,7 @@ set(HEADERS
     stubs.h
     interrupts.h
     types.h
+    python_api.h
 )
 
 # Main executable
