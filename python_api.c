@@ -178,13 +178,13 @@ u32 emu_get_cpu_cycles(EmuHandle handle) {
 void emu_save_state(EmuHandle handle, const char *filename) {
     if (!handle || !filename) return;
     
-    // TODO: Implement save state
+    // TODO: Implement save state functionality
     printf("Python API: Save state not yet implemented\n");
 }
 
 void emu_load_state(EmuHandle handle, const char *filename) {
     if (!handle || !filename) return;
     
-    // TODO: Implement load state
+    // TODO: Implement load state functionality
     printf("Python API: Load state not yet implemented\n");
 }

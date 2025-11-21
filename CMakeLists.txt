@@ -80,10 +80,16 @@ set(HEADERS
     gfx_renderer.h
     input.h
     stubs.h
-    interrupts.h
     types.h
+    interrupts.h
     python_api.h
 )
+
+# Future additions (require refactoring):
+# timer.c timer.h
+# dma.c dma.h  
+# save_state.c save_state.h
+# game_state.c game_state.h
 
 # Main executable
 add_executable(pokemon_emu ${SOURCES} ${HEADERS})

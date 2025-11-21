@@ -219,14 +219,69 @@ class EmeraldEnv(gym.Env):
         return self.frame_buffer.copy()
     
     def _calculate_reward(self) -> float:
-        """Calculate reward for current state (placeholder)"""
-        # TODO: Implement reward function based on game state
-        # Ideas:
-        # - Progress through game (new map, new Pokemon, badges)
-        # - HP changes in battle
-        # - Experience gained
-        # - Items collected
-        return 0.0
+        """Calculate reward for current state"""
+        # Track progress metrics
+        if not hasattr(self, '_prev_state'):
+            self._prev_state = {
+                'badges': 0,
+                'money': 0,
+                'party_hp': 0,
+                'map_id': 0,
+                'frame': 0
+            }
+        
+        reward = 0.0
+        
+        # Get current game state
+        badges = self.read_memory(0x0202420C)
+        money = (self.read_memory(0x02024490) |
+                 (self.read_memory(0x02024491) << 8) |
+                 (self.read_memory(0x02024492) << 16) |
+                 (self.read_memory(0x02024493) << 24))
+        
+        # Reward for gaining badges (huge reward)
+        badge_count = bin(badges).count('1')
+        prev_badge_count = bin(self._prev_state['badges']).count('1')
+        if badge_count > prev_badge_count:
+            reward += 1000.0 * (badge_count - prev_badge_count)
+            print(f"🏆 New badge! Total: {badge_count}")
+        
+        # Reward for gaining money (small reward)
+        money_gained = money - self._prev_state['money']
+        if money_gained > 0:
+            reward += money_gained / 1000.0  # Scale down
+        
+        # Penalty for losing HP
+        party_count = self.read_memory(0x02024284)
+        if party_count > 0 and party_count <= 6:
+            total_hp = 0
+            for i in range(party_count):
+                hp_addr = 0x02024284 + 4 + (i * 100) + 0x56
+                hp = self.read_memory(hp_addr) | (self.read_memory(hp_addr + 1) << 8)
+                total_hp += hp
+            
+            hp_lost = self._prev_state['party_hp'] - total_hp
+            if hp_lost > 0:
+                reward -= hp_lost * 0.1
+        
+        # Small reward for exploring (new map)
+        map_id = self.read_memory(0x02036DFD)
+        if map_id != self._prev_state['map_id']:
+            reward += 5.0
+        
+        # Small time penalty to encourage progress
+        reward -= 0.01
+        
+        # Update previous state
+        self._prev_state = {
+            'badges': badges,
+            'money': money,
+            'party_hp': total_hp if party_count > 0 else 0,
+            'map_id': map_id,
+            'frame': self.frame_count
+        }
+        
+        return reward
     
     def read_memory(self, addr: int) -> int:
         """Read byte from emulator memory"""
