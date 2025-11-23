@@ -9,6 +9,7 @@ void interrupt_init(InterruptState *state) {
     state->ime = 0;
     state->dispstat = 0;
     state->vcount = 0;
+    state->last_scanline = 0;
 }
 
 void interrupt_raise(InterruptState *state, u16 flag) {
@@ -34,7 +35,9 @@ bool interrupt_check(InterruptState *state) {
 void interrupt_update_vcount(InterruptState *state, u16 scanline) {
     if (!state) return;
     
+    u16 prev_scanline = state->last_scanline;
     state->vcount = scanline;
+    state->last_scanline = scanline;
     
     // Check VCount match
     u8 vcount_setting = (state->dispstat >> 8) & 0xFF;
@@ -48,11 +51,11 @@ void interrupt_update_vcount(InterruptState *state, u16 scanline) {
     }
     
     // VBlank flag (scanlines 160-227)
-    if (scanline == 160) {
+    // Only raise interrupt on TRANSITION to scanline 160
+    if (scanline == 160 && prev_scanline != 160) {
         state->dispstat |= 0x01; // Set VBlank flag
-        if (state->dispstat & 0x08) { // VBlank IRQ enable
-            interrupt_raise(state, INT_VBLANK);
-        }
+        // Raise VBlank interrupt (will be checked against IE by interrupt_check)
+        interrupt_raise(state, INT_VBLANK);
     } else if (scanline == 0) {
         state->dispstat &= ~0x01; // Clear VBlank flag
     }

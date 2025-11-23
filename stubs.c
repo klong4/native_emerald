@@ -21,15 +21,6 @@ void load_state(void *state, const char *filename) {
     printf("load_state stub\n");
 }
 
-// timer.c
-void timer_init(TimerState *t) {
-    (void)t;
-}
-
-void timer_update(TimerState *t) {
-    (void)t;
-}
-
 // audio_stub.c
 void audio_init(AudioState *a) {
     (void)a;

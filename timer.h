@@ -3,6 +3,9 @@
 
 #include "types.h"
 
+// Forward declaration
+typedef struct InterruptState InterruptState;
+
 // Timer registers
 #define REG_TM0CNT_L  0x100  // Timer 0 Counter
 #define REG_TM0CNT_H  0x102  // Timer 0 Control
@@ -19,8 +22,6 @@
 #define TIMER_CASCADE   0x04
 #define TIMER_FREQ_MASK 0x03
 
-typedef struct Timer Timer;
-
 typedef struct Timer {
     u16 counter;      // Current counter value
     u16 reload;       // Reload value
@@ -32,12 +33,12 @@ typedef struct Timer {
     u32 clock;        // Internal clock counter
 } Timer;
 
-typedef struct {
+typedef struct TimerState {
     Timer timers[4];
 } TimerState;
 
 void timer_init(TimerState *state);
-void timer_update(TimerState *state, u32 cycles);
+void timer_update(TimerState *state, u32 cycles, InterruptState *interrupts);
 void timer_write_control(TimerState *state, int timer_id, u16 value);
 void timer_write_reload(TimerState *state, int timer_id, u16 value);
 u16 timer_read_counter(TimerState *state, int timer_id);

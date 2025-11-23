@@ -71,6 +71,11 @@ set(SOURCES
     stubs.c
     interrupts.c
     python_api.c
+    bios.c
+    debug_trace.c
+    timer.c
+    dma.c
+    rtc.c
 )
 
 set(HEADERS
@@ -83,11 +88,14 @@ set(HEADERS
     types.h
     interrupts.h
     python_api.h
+    bios.h
+    debug_trace.h
+    timer.h
+    dma.h
+    rtc.h
 )
 
 # Future additions (require refactoring):
-# timer.c timer.h
-# dma.c dma.h  
 # save_state.c save_state.h
 # game_state.c game_state.h
 

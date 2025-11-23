@@ -64,10 +64,14 @@ void emu_step(EmuHandle handle, u8 buttons) {
     mem_set_ai_input(&emu->memory, buttons);
     input_update(&emu->input, &emu->memory);
     
-    // Execute one frame
+    // Clear VBlank at start of frame (back to scanline 0)
+    interrupt_update_vcount(&emu->interrupts, 0);
+    
+    // Execute one frame (game code runs)
     cpu_execute_frame(&emu->cpu, &emu->memory, &emu->interrupts);
     
-    // Update interrupts for VBlank
+    // Trigger VBlank interrupt at END of frame (scanline 160)
+    // This will be processed at the START of next frame's execution
     interrupt_update_vcount(&emu->interrupts, 160);
     
     // Render graphics

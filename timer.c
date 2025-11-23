@@ -20,7 +20,7 @@ static u32 get_prescaler(u16 control) {
     return 1;
 }
 
-void timer_update(TimerState *state, u32 cycles) {
+void timer_update(TimerState *state, u32 cycles, InterruptState *interrupts) {
     for (int i = 0; i < 4; i++) {
         Timer *timer = &state->timers[i];
         
@@ -45,8 +45,8 @@ void timer_update(TimerState *state, u32 cycles) {
                 timer->counter = timer->reload;
                 
                 // Trigger IRQ if enabled
-                if (timer->irq_enable) {
-                    // IRQ will be raised by memory system
+                if (timer->irq_enable && interrupts) {
+                    interrupt_raise(interrupts, INT_TIMER0 << i);
                 }
                 
                 // Increment cascade timer if enabled
@@ -54,8 +54,8 @@ void timer_update(TimerState *state, u32 cycles) {
                     state->timers[i + 1].counter++;
                     if (state->timers[i + 1].counter == 0) {
                         state->timers[i + 1].counter = state->timers[i + 1].reload;
-                        if (state->timers[i + 1].irq_enable) {
-                            // IRQ for cascaded timer
+                        if (state->timers[i + 1].irq_enable && interrupts) {
+                            interrupt_raise(interrupts, INT_TIMER0 << (i + 1));
                         }
                     }
                 }

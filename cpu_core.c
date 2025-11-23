@@ -1,6 +1,7 @@
 #include "cpu_core.h"
 #include "memory.h"
 #include "interrupts.h"
+#include "debug_trace.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -63,8 +64,10 @@ void cpu_reset(ARM7TDMI *cpu) {
     
     cpu_init(cpu);
     
-    // GBA starts at 0x08000000 in ARM mode
-    cpu->r[15] = ADDR_ROM_START;  // PC
+    // Skip BIOS and jump directly to ROM for now
+    // BIOS boot has some issues that need more investigation
+    // Note: PC (R15) is always ahead by +8 (ARM) or +4 (Thumb)
+    cpu->r[15] = 0x08000000 + 8;  // PC - ROM entry point + pipeline offset
     cpu->r[13] = 0x03007F00;      // SP (default)
     cpu->thumb_mode = false;
     cpu->cpsr = 0x1F;  // System mode
@@ -228,6 +231,119 @@ static u32 execute_arm(ARM7TDMI *cpu, Memory *mem, u32 opcode) {
     
     u32 op_type = ARM_OP(opcode);
     
+    // Branch and exchange (BX) - MUST be checked before MSR/data processing!
+    // Pattern: 0xE12FFF1x where x is the register
+    if ((opcode & 0x0FFFFFF0) == 0x012FFF10) {
+        u32 rn = opcode & 0xF;
+        // When rn is PC, it reads as current instruction + 8
+        // R15 is PC+12 after increment, subtract 4 to get PC+8
+        u32 addr = (rn == 15) ? (cpu->r[15] - 4) : cpu->r[rn];
+        
+        // Log when game tries to branch to BIOS (address 0-0x1C)
+        // This indicates a reset or exception - we want to know why
+        if (addr <= 0x1C) {
+            static int bx_zero_count = 0;
+            if (bx_zero_count < 10) {
+                printf("\n[BX→BIOS #%d] PC=0x%08X: BX R%d (value=0x%08X) - Function returned NULL!\n",
+                       bx_zero_count, cpu->r[15] - 4, rn, addr);
+                printf("  Return registers: R0=%08X R1=%08X R2=%08X R3=%08X\n",
+                       cpu->r[0], cpu->r[1], cpu->r[2], cpu->r[3]);
+                printf("  Link Register: LR=0x%08X (return address from last BL/BLX)\n", cpu->r[14]);
+                printf("  Stack Pointer: SP=0x%08X, CPSR=%08X\n", cpu->r[13], cpu->cpsr);
+                printf("  This suggests the called function at 0x%08X failed and returned NULL\n",
+                       (cpu->r[14] & ~1) - 4);
+                bx_zero_count++;
+            }
+        }
+        
+        // Validate branch target is in valid memory region
+        // Valid regions: ROM (0x08000000+), IWRAM (0x03000000+), EWRAM (0x02000000+)
+        if (addr >= 0x10000000 || (addr >= 0x04000000 && addr < 0x08000000)) {
+            static u32 logged_bx = 0;
+            if (logged_bx != cpu->r[15] - 4) {
+                printf("[BX] Invalid target 0x%08X from PC=0x%08X, R%d=0x%08X, skipping\n",
+                       addr, cpu->r[15] - 4, rn, cpu->r[rn]);
+                logged_bx = cpu->r[15] - 4;
+            }
+            // Don't branch to invalid address - just skip this instruction
+            return 3;
+        }
+        
+        // Track BX LR (function returns) to see if functions are completing successfully
+        static int bx_lr_count = 0;
+        if (rn == 14 && bx_lr_count < 10 && addr > 0x08000000 && addr < 0x09000000) {
+            printf("[ARM BX LR] Returning from PC=0x%08X to 0x%08X (Thumb=%d), R0=0x%08X\n",
+                   cpu->r[15] - 4, addr, addr & 1, cpu->r[0]);
+            bx_lr_count++;
+        }
+        
+        cpu->thumb_mode = addr & 1;
+        u32 target = addr & 0xFFFFFFFE;
+        // Set R15 to maintain pipeline invariant: R15 = PC + (thumb ? 4 : 8)
+        cpu->r[15] = target + (cpu->thumb_mode ? 4 : 8);
+        
+        return 3;
+    }
+    
+    // MRS - Move PSR to register (must be checked before data processing)
+    if ((opcode & 0x0FBF0FFF) == 0x010F0000) {
+        u32 rd = ARM_RD(opcode);
+        bool spsr = opcode & (1 << 22);
+        
+        if (spsr) {
+            // SPSR not implemented yet - use CPSR
+            cpu->r[rd] = cpu->cpsr;
+        } else {
+            cpu->r[rd] = cpu->cpsr;
+        }
+        return 1;
+    }
+    
+    // MSR - Move register to PSR (must be checked before data processing)
+    if (((opcode & 0x0FB00000) == 0x03200000) || ((opcode & 0x0DB00000) == 0x01200000)) {
+        bool immediate = opcode & (1 << 25);
+        bool spsr = opcode & (1 << 22);
+        u32 field_mask = 0;
+        
+        if (opcode & (1 << 16)) field_mask |= 0x000000FF; // Control field
+        if (opcode & (1 << 17)) field_mask |= 0x0000FF00; // Extension field
+        if (opcode & (1 << 18)) field_mask |= 0x00FF0000; // Status field
+        if (opcode & (1 << 19)) field_mask |= 0xFF000000; // Flags field
+        
+        u32 value;
+        if (immediate) {
+            u32 imm = ARM_IMM(opcode);
+            u32 rotate = ARM_ROTATE(opcode) * 2;
+            value = (imm >> rotate) | (imm << (32 - rotate));
+        } else {
+            value = cpu->r[ARM_RM(opcode)];
+        }
+        
+        if (spsr) {
+            // SPSR not implemented - ignore
+        } else {
+            u32 new_cpsr = (cpu->cpsr & ~field_mask) | (value & field_mask);
+            
+            // Validate mode bits if control field is being modified
+            if (field_mask & 0xFF) {
+                u32 new_mode = new_cpsr & 0x1F;
+                // Valid ARM modes: 0x10=User, 0x11=FIQ, 0x12=IRQ, 0x13=Supervisor,
+                // 0x17=Abort, 0x1B=Undefined, 0x1F=System
+                if (new_mode != 0x10 && new_mode != 0x11 && new_mode != 0x12 && 
+                    new_mode != 0x13 && new_mode != 0x17 && new_mode != 0x1B && new_mode != 0x1F) {
+                    // Invalid mode - preserve current mode bits
+                    new_cpsr = (new_cpsr & ~0x1F) | (cpu->cpsr & 0x1F);
+                }
+            }
+            
+            cpu->cpsr = new_cpsr;
+            // Update thumb_mode flag if bit 5 changed
+            // NOTE: Bit 5 (0x20) is the Thumb state bit in CPSR
+            cpu->thumb_mode = (cpu->cpsr & (1 << 5)) != 0;
+        }
+        return 1;
+    }
+    
     // Multiply (000x with bits 4-7 = 1001)
     if ((opcode & 0x0FC000F0) == 0x00000090) {
         bool accumulate = opcode & (1 << 21);
@@ -237,8 +353,14 @@ static u32 execute_arm(ARM7TDMI *cpu, Memory *mem, u32 opcode) {
         u32 rs = ARM_RS(opcode);
         u32 rm = ARM_RM(opcode);
         
-        u32 result = cpu->r[rm] * cpu->r[rs];
-        if (accumulate) result += cpu->r[rn];
+        // Note: PC not typically used in multiply, but handle it correctly anyway
+        // R15 is PC+12 after increment, subtract 4 to get PC+8
+        u32 rm_val = (rm == 15) ? (cpu->r[15] - 4) : cpu->r[rm];
+        u32 rs_val = (rs == 15) ? (cpu->r[15] - 4) : cpu->r[rs];
+        u32 rn_val = (rn == 15) ? (cpu->r[15] - 4) : cpu->r[rn];
+        
+        u32 result = rm_val * rs_val;
+        if (accumulate) result += rn_val;
         
         cpu->r[rd] = result;
         if (set_flags) {
@@ -254,14 +376,17 @@ static u32 execute_arm(ARM7TDMI *cpu, Memory *mem, u32 opcode) {
         u32 rd = ARM_RD(opcode);
         u32 rm = ARM_RM(opcode);
         
-        u32 addr = cpu->r[rn];
+        // When rn/rm is PC, it reads as current instruction + 8
+        // R15 is PC+12 after increment, subtract 4 to get PC+8
+        u32 addr = (rn == 15) ? (cpu->r[15] - 4) : cpu->r[rn];
+        u32 rm_val = (rm == 15) ? (cpu->r[15] - 4) : cpu->r[rm];
         if (byte) {
             u32 temp = mem_read8(mem, addr);
-            mem_write8(mem, addr, cpu->r[rm] & 0xFF);
+            mem_write8(mem, addr, rm_val & 0xFF);
             cpu->r[rd] = temp;
         } else {
             u32 temp = mem_read32(mem, addr & ~3);
-            mem_write32(mem, addr & ~3, cpu->r[rm]);
+            mem_write32(mem, addr & ~3, rm_val);
             cpu->r[rd] = temp;
         }
         return 4;
@@ -302,11 +427,16 @@ static u32 execute_arm(ARM7TDMI *cpu, Memory *mem, u32 opcode) {
                 shift_amount = (shift >> 3) & 0x1F;
             }
             
-            operand2 = barrel_shift(cpu, cpu->r[rm], shift_type, shift_amount, 
+            // When rm is r15 (PC), it reads as current instruction + 8
+            // R15 is PC+12 after increment, subtract 4 to get PC+8
+            u32 rm_val = (rm == 15) ? (cpu->r[15] - 4) : cpu->r[rm];
+            operand2 = barrel_shift(cpu, rm_val, shift_type, shift_amount, 
                                    set_flags && (opcode_type & 0xC) != 0x8);
         }
         
-        u32 op1 = cpu->r[rn];
+        // When rn is r15 (PC), it reads as current instruction + 8
+        // R15 is PC+12 after increment, subtract 4 to get PC+8
+        u32 op1 = (rn == 15) ? (cpu->r[15] - 4) : cpu->r[rn];
         u32 result = 0;
         
         switch (opcode_type) {
@@ -389,8 +519,29 @@ static u32 execute_arm(ARM7TDMI *cpu, Memory *mem, u32 opcode) {
         }
         
         if (rd == 15) {
-            cpu->r[15] = result & 0xFFFFFFFE;
-            cpu->thumb_mode = result & 1;
+            // When writing to PC with S flag set, restore CPSR from SPSR
+            // This is used for exception returns (e.g., SUBS PC, LR, #4)
+            if (set_flags) {
+                cpu->cpsr = cpu->spsr;
+                cpu->thumb_mode = (cpu->cpsr & (1 << 5)) != 0;
+            }
+            
+            u32 new_pc = result & 0xFFFFFFFE;
+            // Validate PC target is in valid memory region
+            if (new_pc >= 0x10000000 || (new_pc >= 0x04000000 && new_pc < 0x08000000)) {
+                static u32 logged_mov_pc = 0;
+                if (logged_mov_pc != cpu->r[15] - 4) {
+                    printf("[MOV PC] Invalid target 0x%08X from PC=0x%08X, skipping\n",
+                           new_pc, cpu->r[15] - 4);
+                    logged_mov_pc = cpu->r[15] - 4;
+                }
+                // Don't modify PC to invalid address
+            } else {
+                cpu->r[15] = new_pc;
+                if (!set_flags) { // Only set thumb mode from bit 0 if NOT restoring CPSR
+                    cpu->thumb_mode = result & 1;
+                }
+            }
         }
         
         return 1;
@@ -415,10 +566,16 @@ static u32 execute_arm(ARM7TDMI *cpu, Memory *mem, u32 opcode) {
             u32 shift = (opcode >> 4) & 0xFF;
             u32 shift_type = (shift >> 1) & 3;
             u32 shift_amount = (shift >> 3) & 0x1F;
-            offset = barrel_shift(cpu, cpu->r[rm], shift_type, shift_amount, false);
+            // When rm is PC, it reads as current instruction + 8
+            // R15 is PC+12 after increment, subtract 4 to get PC+8
+            u32 rm_val = (rm == 15) ? (cpu->r[15] - 4) : cpu->r[rm];
+            offset = barrel_shift(cpu, rm_val, shift_type, shift_amount, false);
         }
         
-        u32 addr = cpu->r[rn];
+        // When rn is PC, it reads as current instruction + 8
+        // R15 is PC+12 after increment, subtract 4 to get PC+8
+        u32 addr = (rn == 15) ? (cpu->r[15] - 4) : cpu->r[rn];
+        
         if (pre_index) {
             if (up) addr += offset;
             else addr -= offset;
@@ -434,11 +591,31 @@ static u32 execute_arm(ARM7TDMI *cpu, Memory *mem, u32 opcode) {
                     cpu->r[rd] = (cpu->r[rd] >> rotate) | (cpu->r[rd] << (32 - rotate));
                 }
             }
+            // If loading into PC, handle mode switching
+            if (rd == 15) {
+                u32 new_pc = cpu->r[15] & 0xFFFFFFFE;
+                // Validate PC target is in valid memory region
+                if (new_pc >= 0x10000000 || (new_pc >= 0x04000000 && new_pc < 0x08000000)) {
+                    static u32 logged_ldr_pc = 0;
+                    if (logged_ldr_pc != (cpu->r[15] - 4)) {
+                        printf("[LDR PC] Invalid target 0x%08X from PC=0x%08X, addr=0x%08X, skipping\n",
+                               new_pc, cpu->r[15] - 4, addr);
+                        logged_ldr_pc = cpu->r[15] - 4;
+                    }
+                    // Reset PC to next instruction instead
+                    cpu->r[15] = (cpu->r[15] - 4) + 4;  // Just continue
+                } else {
+                    cpu->thumb_mode = cpu->r[15] & 1;
+                    cpu->r[15] = new_pc;
+                }
+            }
         } else {
+            // When rd is PC for store, it stores PC+12 (R15 is PC+8, so +4 more)
+            u32 store_val = (rd == 15) ? (cpu->r[15] + 4) : cpu->r[rd];
             if (byte) {
-                mem_write8(mem, addr, cpu->r[rd] & 0xFF);
+                mem_write8(mem, addr, store_val & 0xFF);
             } else {
-                mem_write32(mem, addr & ~3, cpu->r[rd]);
+                mem_write32(mem, addr & ~3, store_val);
             }
         }
         
@@ -462,7 +639,9 @@ static u32 execute_arm(ARM7TDMI *cpu, Memory *mem, u32 opcode) {
         u32 rn = ARM_RN(opcode);
         u32 rlist = opcode & 0xFFFF;
         
-        u32 addr = cpu->r[rn];
+        // When rn is PC, it reads as current instruction + 8
+        // R15 is PC+12 after increment, subtract 4 to get PC+8
+        u32 addr = (rn == 15) ? (cpu->r[15] - 4) : cpu->r[rn];
         int count = 0;
         for (int i = 0; i < 16; i++) {
             if (rlist & (1 << i)) count++;
@@ -479,11 +658,32 @@ static u32 execute_arm(ARM7TDMI *cpu, Memory *mem, u32 opcode) {
                 if (load) {
                     cpu->r[i] = mem_read32(mem, addr & ~3);
                 } else {
-                    mem_write32(mem, addr & ~3, cpu->r[i]);
+                    // When storing PC, it stores PC+12 (R15 is PC+8, so +4 more)
+                    u32 store_val = (i == 15) ? (cpu->r[15] + 4) : cpu->r[i];
+                    mem_write32(mem, addr & ~3, store_val);
                 }
                 
                 if (!pre_index) addr += 4;
             }
+        }
+        
+        // If PC was loaded, handle mode switching
+        if (load && (rlist & (1 << 15))) {
+            // If load_psr (S bit) is set and we're loading PC:
+            // - In privileged modes (not User/System): restore CPSR from SPSR (exception return)
+            // - In User/System modes: load user registers (doesn't affect CPSR)
+            u32 current_mode = cpu->cpsr & 0x1F;
+            bool is_privileged = (current_mode != 0x10 && current_mode != 0x1F);
+            
+            if (load_psr && is_privileged) {
+                // Exception return: restore CPSR from SPSR
+                cpu->cpsr = cpu->spsr;
+                cpu->thumb_mode = (cpu->cpsr & (1 << 5)) != 0;
+            } else {
+                // Normal return or user-mode LDM: use PC bit 0 for mode
+                cpu->thumb_mode = cpu->r[15] & 1;
+            }
+            cpu->r[15] = cpu->r[15] & 0xFFFFFFFE;
         }
         
         if (writeback) {
@@ -491,7 +691,6 @@ static u32 execute_arm(ARM7TDMI *cpu, Memory *mem, u32 opcode) {
             else cpu->r[rn] = start_addr;
         }
         
-        (void)load_psr; // TODO: Handle PSR transfer
         return count + 2;
     }
     
@@ -501,10 +700,20 @@ static u32 execute_arm(ARM7TDMI *cpu, Memory *mem, u32 opcode) {
         s32 offset = (s32)(ARM_OFFSET24(opcode) << 8) >> 6; // Sign extend and *4
         
         if (link) {
-            cpu->r[14] = cpu->r[15] - 4; // Save return address
+            // LR = address of next instruction = (current PC) + 4
+            // R15 is currently PC+12, so (R15-12)+4 = R15-8
+            cpu->r[14] = cpu->r[15] - 8;
         }
         
-        cpu->r[15] = (cpu->r[15] + offset) & 0xFFFFFFFE;
+        // Branch: offset is relative to PC+8
+        // R15 is currently PC+12 (after increment in cpu_step)
+        // So PC+8 = R15-4
+        u32 pc_plus_8 = cpu->r[15] - 4;
+        u32 target = (pc_plus_8 + offset) & 0xFFFFFFFE;
+        
+        // Set R15 to target+8 to maintain PC+8 invariant
+        cpu->r[15] = target + 8;
+        
         return 3;
     }
     
@@ -524,10 +733,14 @@ static u32 execute_arm(ARM7TDMI *cpu, Memory *mem, u32 opcode) {
             offset = ((opcode >> 4) & 0xF0) | (opcode & 0xF);
         } else {
             u32 rm = ARM_RM(opcode);
-            offset = cpu->r[rm];
+            // When rm is PC, it reads as current instruction + 8
+            // R15 is PC+12 after increment, subtract 4 to get PC+8
+            offset = (rm == 15) ? (cpu->r[15] - 4) : cpu->r[rm];
         }
         
-        u32 addr = cpu->r[rn];
+        // When rn is PC, it reads as current instruction + 8
+        // R15 is PC+12 after increment, subtract 4 to get PC+8
+        u32 addr = (rn == 15) ? (cpu->r[15] - 4) : cpu->r[rn];
         if (pre_index) {
             if (up) addr += offset;
             else addr -= offset;
@@ -545,28 +758,26 @@ static u32 execute_arm(ARM7TDMI *cpu, Memory *mem, u32 opcode) {
                     cpu->r[rd] = (s32)(s16)mem_read16(mem, addr & ~1);
                     break;
             }
+            // If loading into PC, handle mode switching
+            if (rd == 15) {
+                cpu->thumb_mode = cpu->r[rd] & 1;
+                cpu->r[15] = cpu->r[15] & 0xFFFFFFFE;
+            }
         } else {
             if (sh == 1) { // STRH
-                mem_write16(mem, addr & ~1, cpu->r[rd] & 0xFFFF);
+                // When rd is PC, it stores PC+12 (R15 is PC+8, so +4 more)
+                u32 store_val = (rd == 15) ? (cpu->r[15] + 4) : cpu->r[rd];
+                mem_write16(mem, addr & ~1, store_val & 0xFFFF);
             }
         }
         
         if (!pre_index) {
             if (up) cpu->r[rn] += offset;
             else cpu->r[rn] -= offset;
-        } else if (writeback) {
+        } else if (writeback && rn != rd) {  // No writeback if rn == rd for loads
             cpu->r[rn] = addr;
         }
         
-        return 3;
-    }
-    
-    // Branch and exchange (BX)
-    if ((opcode & 0x0FFFFFF0) == 0x012FFF10) {
-        u32 rn = opcode & 0xF;
-        u32 addr = cpu->r[rn];
-        cpu->thumb_mode = addr & 1;
-        cpu->r[15] = addr & 0xFFFFFFFE;
         return 3;
     }
     
@@ -580,6 +791,23 @@ static u32 execute_arm(ARM7TDMI *cpu, Memory *mem, u32 opcode) {
                 cpu->r[13] = 0x03007F00;
                 cpu->r[15] = 0x08000000;
                 cpu->cpsr = 0x000000D3;
+                break;
+                
+            case 0x01: // RegisterRamReset
+                {
+                    // R0 contains flags for what to reset
+                    u32 flags = cpu->r[0];
+                    printf("[BIOS] RegisterRamReset called with flags=0x%02X\n", flags);
+                    // Bit 0: Clear 256KB EWRAM
+                    // Bit 1: Clear 32KB IWRAM (excluding last 0x200 bytes for stack)
+                    // Bit 2: Clear Palette RAM
+                    // Bit 3: Clear VRAM
+                    // Bit 4: Clear OAM
+                    // Bit 5: Reset SIO registers
+                    // Bit 6: Reset Sound registers
+                    // Bit 7: Reset all other registers
+                    // For now just acknowledge - memory should already be zero-initialized
+                }
                 break;
                 
             case 0x02: // Halt
@@ -687,6 +915,44 @@ static u32 execute_arm(ARM7TDMI *cpu, Memory *mem, u32 opcode) {
                 cpu->r[0] = 0xBAAE187F;
                 break;
                 
+            case 0x0E: // BgAffineSet
+                // R0 = source, R1 = dest, R2 = count
+                // Affine transformation for backgrounds
+                // Just acknowledge for now
+                break;
+                
+            case 0x0F: // ObjAffineSet  
+                // R0 = source, R1 = dest, R2 = count, R3 = offset
+                // Affine transformation for sprites
+                // Just acknowledge for now
+                break;
+                
+            case 0x13: // HuffUnComp
+                // Huffman decompression - rarely used
+                // Just acknowledge for now
+                break;
+                
+            case 0x16: // Diff8bitUnFilterWram
+            case 0x17: // Diff8bitUnFilterVram
+            case 0x18: // Diff16bitUnFilter
+                // Differential filter decompression
+                // Just acknowledge for now
+                break;
+                
+            case 0x19: // SoundBias
+                // Sound bias control
+                break;
+                
+            case 0x1F: // MidiKey2Freq
+                // MIDI key to frequency conversion
+                // Just acknowledge
+                break;
+                
+            case 0x28: // SoundDriverVSyncOff
+            case 0x29: // SoundDriverVSyncOn  
+                // Sound driver vsync control
+                break;
+                
             case 0x11: // LZ77UnCompWram
             case 0x12: // LZ77UnCompVram
                 {
@@ -757,48 +1023,6 @@ static u32 execute_arm(ARM7TDMI *cpu, Memory *mem, u32 opcode) {
         return 3;
     }
     
-    // MRS - Move PSR to register
-    if ((opcode & 0x0FBF0FFF) == 0x010F0000) {
-        u32 rd = ARM_RD(opcode);
-        bool spsr = opcode & (1 << 22);
-        
-        if (spsr) {
-            // SPSR not implemented yet - use CPSR
-            cpu->r[rd] = cpu->cpsr;
-        } else {
-            cpu->r[rd] = cpu->cpsr;
-        }
-        return 1;
-    }
-    
-    // MSR - Move register to PSR
-    if (((opcode & 0x0FB00000) == 0x03200000) || ((opcode & 0x0DB00000) == 0x01200000)) {
-        bool immediate = opcode & (1 << 25);
-        bool spsr = opcode & (1 << 22);
-        u32 field_mask = 0;
-        
-        if (opcode & (1 << 16)) field_mask |= 0x000000FF; // Control field
-        if (opcode & (1 << 17)) field_mask |= 0x0000FF00; // Extension field
-        if (opcode & (1 << 18)) field_mask |= 0x00FF0000; // Status field
-        if (opcode & (1 << 19)) field_mask |= 0xFF000000; // Flags field
-        
-        u32 value;
-        if (immediate) {
-            u32 imm = ARM_IMM(opcode);
-            u32 rotate = ARM_ROTATE(opcode) * 2;
-            value = (imm >> rotate) | (imm << (32 - rotate));
-        } else {
-            value = cpu->r[ARM_RM(opcode)];
-        }
-        
-        if (spsr) {
-            // SPSR not implemented - ignore
-        } else {
-            cpu->cpsr = (cpu->cpsr & ~field_mask) | (value & field_mask);
-        }
-        return 1;
-    }
-    
     // Coprocessor instructions - stub them out
     // CDP - Coprocessor data processing
     if ((opcode & 0x0F000010) == 0x0E000000) {
@@ -825,7 +1049,7 @@ static u32 execute_arm(ARM7TDMI *cpu, Memory *mem, u32 opcode) {
 // Thumb instruction execution
 static u32 execute_thumb(ARM7TDMI *cpu, Memory *mem, u16 opcode) {
     // Move shifted register (000xx)
-    if (((opcode >> 13) & 0x7) <= 0x1) {
+    if (((opcode >> 13) & 0x7) == 0x0) {
         u32 offset = THUMB_OFFSET5(opcode);
         u32 rs = THUMB_RS(opcode);
         u32 rd = THUMB_RD(opcode);
@@ -1006,8 +1230,17 @@ static u32 execute_thumb(ARM7TDMI *cpu, Memory *mem, u16 opcode) {
         
         switch (op) {
             case 0: // ADD
-                cpu->r[rd] += cpu->r[rs];
-                if (rd == 15) cpu->r[15] &= ~1;
+                {
+                    u32 result = cpu->r[rd] + cpu->r[rs];
+                    if (rd == 15) {
+                        // Adding to PC - extract Thumb bit and add pipeline offset
+                        cpu->thumb_mode = result & 1;
+                        u32 target = result & 0xFFFFFFFE;
+                        cpu->r[15] = target + (cpu->thumb_mode ? 4 : 8);
+                    } else {
+                        cpu->r[rd] = result;
+                    }
+                }
                 break;
             case 1: // CMP
                 {
@@ -1016,14 +1249,22 @@ static u32 execute_thumb(ARM7TDMI *cpu, Memory *mem, u16 opcode) {
                 }
                 break;
             case 2: // MOV
-                cpu->r[rd] = cpu->r[rs];
-                if (rd == 15) cpu->r[15] &= ~1;
+                if (rd == 15) {
+                    // Moving to PC - extract Thumb bit and add pipeline offset
+                    cpu->thumb_mode = cpu->r[rs] & 1;
+                    u32 target = cpu->r[rs] & 0xFFFFFFFE;
+                    cpu->r[15] = target + (cpu->thumb_mode ? 4 : 8);
+                } else {
+                    cpu->r[rd] = cpu->r[rs];
+                }
                 break;
             case 3: // BX/BLX
                 {
                     u32 addr = cpu->r[rs];
                     cpu->thumb_mode = addr & 1;
-                    cpu->r[15] = addr & 0xFFFFFFFE;
+                    u32 target = addr & 0xFFFFFFFE;
+                    // Set R15 to maintain pipeline invariant: R15 = PC + (thumb ? 4 : 8)
+                    cpu->r[15] = target + (cpu->thumb_mode ? 4 : 8);
                 }
                 return 3;
         }
@@ -1034,7 +1275,8 @@ static u32 execute_thumb(ARM7TDMI *cpu, Memory *mem, u16 opcode) {
     if (((opcode >> 11) & 0x1F) == 0x9) {
         u32 rd = (opcode >> 8) & 0x7;
         u32 offset = (opcode & 0xFF) << 2;
-        u32 addr = (cpu->r[15] & ~2) + offset;
+        // PC should be current instruction + 4, but R15 is incremented to PC+6, so subtract 2
+        u32 addr = ((cpu->r[15] - 2) & ~3) + offset;
         cpu->r[rd] = mem_read32(mem, addr & ~3);
         return 3;
     }
@@ -1156,7 +1398,8 @@ static u32 execute_thumb(ARM7TDMI *cpu, Memory *mem, u16 opcode) {
         if (sp) {
             cpu->r[rd] = cpu->r[13] + offset;
         } else {
-            cpu->r[rd] = (cpu->r[15] & ~2) + offset;
+            // PC should be current instruction + 4, but R15 is incremented to PC+6, so subtract 2
+            cpu->r[rd] = ((cpu->r[15] - 2) & ~3) + offset;
         }
         return 1;
     }
@@ -1188,9 +1431,13 @@ static u32 execute_thumb(ARM7TDMI *cpu, Memory *mem, u16 opcode) {
                 }
             }
             if (pc_lr) {
-                cpu->r[15] = mem_read32(mem, cpu->r[13] & ~3);
+                u32 addr = mem_read32(mem, cpu->r[13] & ~3);
                 cpu->r[13] += 4;
-                cpu->r[15] &= ~1;
+                // Extract Thumb mode from bit 0 of the popped address
+                cpu->thumb_mode = addr & 1;
+                // Mask off Thumb bit and add pipeline offset
+                u32 target = addr & 0xFFFFFFFE;
+                cpu->r[15] = target + (cpu->thumb_mode ? 4 : 8);
             }
         } else { // PUSH
             if (pc_lr) {
@@ -1240,7 +1487,13 @@ static u32 execute_thumb(ARM7TDMI *cpu, Memory *mem, u16 opcode) {
         s32 offset = (s32)(s8)(opcode & 0xFF) * 2;
         
         if (check_condition(cpu, cond)) {
-            cpu->r[15] = (cpu->r[15] + offset) & 0xFFFFFFFE;
+            // R15 is at PC+6 after pipeline increment (instruction+4+2)
+            // Branch offset is relative to PC+4 (instruction address + 4)
+            // Calculate target instruction address: (R15 - 2) + offset = (instr+4+2-2) + offset = (instr+4) + offset
+            // But we need to set R15 for next fetch, which expects R15-4 = target instruction
+            // So set R15 = target + 4
+            u32 target_addr = ((cpu->r[15] - 2) + offset) & 0xFFFFFFFE;
+            cpu->r[15] = target_addr + 4;
             return 3;
         }
         return 1;
@@ -1248,9 +1501,65 @@ static u32 execute_thumb(ARM7TDMI *cpu, Memory *mem, u16 opcode) {
     
     // Software interrupt (11011111)
     if ((opcode & 0xFF00) == 0xDF00) {
-        // SWI - similar to ARM SWI handling
+        // SWI in Thumb mode - handle same as ARM SWI
         u32 comment = opcode & 0xFF;
-        // Basic BIOS call handling
+        
+        // Call ARM SWI handler (it's implemented in ARM mode section)
+        // For now, handle common SWIs here
+        switch (comment) {
+            case 0x02: // Halt
+            case 0x03: // Stop
+                cpu->halted = true;
+                break;
+            case 0x04: // IntrWait
+            case 0x05: // VBlankIntrWait
+                cpu->halted = true;
+                break;
+            case 0x06: // Div
+                {
+                    s32 num = (s32)cpu->r[0];
+                    s32 denom = (s32)cpu->r[1];
+                    if (denom != 0) {
+                        cpu->r[0] = (u32)(num / denom);
+                        cpu->r[1] = (u32)(num % denom);
+                        s32 abs_num = num < 0 ? -num : num;
+                        s32 abs_denom = denom < 0 ? -denom : denom;
+                        cpu->r[3] = (u32)(abs_num / abs_denom);
+                    }
+                }
+                break;
+            case 0x08: // Sqrt
+                {
+                    u32 val = cpu->r[0];
+                    u32 result = 0;
+                    u32 bit = 1 << 30;
+                    while (bit > val) bit >>= 2;
+                    while (bit != 0) {
+                        if (val >= result + bit) {
+                            val -= result + bit;
+                            result = (result >> 1) + bit;
+                        } else {
+                            result >>= 1;
+                        }
+                        bit >>= 2;
+                    }
+                    cpu->r[0] = result;
+                }
+                break;
+            case 0x0B: // CpuSet
+            case 0x0C: // CpuFastSet
+                // Memory copy/fill operations
+                // R0 = source, R1 = dest, R2 = length/mode
+                // For now, just acknowledge
+                break;
+            case 0x0D: // GetBiosChecksum
+                cpu->r[0] = 0xBAAE187F; // Correct BIOS checksum
+                break;
+            default:
+                // Unknown SWI
+                break;
+        }
+        
         return 3;
     }
     
@@ -1261,22 +1570,86 @@ static u32 execute_thumb(ARM7TDMI *cpu, Memory *mem, u16 opcode) {
         return 3;
     }
     
-    // Long branch with link (1111x)
+    // Long branch with link (1111x) - 32-bit instruction
     if (((opcode >> 12) & 0xF) == 0xF) {
         bool second_instruction = opcode & (1 << 11);
-        u32 offset = opcode & 0x7FF;
         
         if (!second_instruction) {
-            // First instruction: LR = PC + (offset << 12)
-            s32 sign_extended = (s32)(offset << 21) >> 9; // Sign extend
-            cpu->r[14] = cpu->r[15] + sign_extended;
+            // First half of BL/BLX - fetch second half and execute as single instruction
+            u32 offset_high = opcode & 0x7FF;
+            s32 sign_extended = (s32)(offset_high << 21) >> 9; // Sign extend and shift
+            
+            // Fetch second half of instruction
+            // At this point: R15 has been incremented by 2 (in cpu_step)
+            // Original PC was: current_R15 - 2
+            // Current instruction (first half) is at: (original_PC) - 4 = R15 - 6
+            // Second half is at: current_instruction + 2 = R15 - 4
+            u16 second_half = mem_read16(mem, cpu->r[15] - 4);
+            cpu->r[15] += 2; // Advance PC past second half (now at next instruction + 4)
+            
+            // Check if this is BL (1111 1xxx) or BLX (1110 1xxx)
+            // BLX: bits 12-15 = 1110 (switches to ARM mode)
+            // BL:  bits 12-15 = 1111 (stays in Thumb mode)
+            bool is_blx = ((second_half >> 12) == 0xE); // Exactly 1110, not 1111
+            bool is_bl = ((second_half >> 12) == 0xF);   // Exactly 1111
+            
+            if ((is_bl || is_blx) && (second_half & (1 << 11))) {
+                u32 offset_low = second_half & 0x7FF;
+                
+                // Calculate target address
+                // R15 is now at: (instruction_addr + 4) + 4 = instruction_addr + 8
+                // BL offset is relative to (instruction_addr + 4)
+                // So target = (R15 - 4) + offset
+                u32 base_pc = cpu->r[15] - 4;
+                u32 target = base_pc + sign_extended + (offset_low << 1);
+                
+                // For BLX, add the H bit (bit 0 of target is determined by bit 0 of instruction)
+                if (is_blx) {
+                    // BLX switches to ARM mode - bit 1 of offset determines final bit
+                    target = (target & 0xFFFFFFFC) | ((second_half & 1) << 1);
+                }
+                
+                static int bl_count = 0;
+                static u32 last_blx_target = 0;
+                u32 instr_addr = cpu->r[15] - 8;
+                
+                // Log BLX instructions and problematic BL calls around 0x3C6
+                if (is_blx && (bl_count < 15 || target != last_blx_target)) {
+                    printf("[THUMB BLX #%d] PC=0x%08X → target=0x%08X (second_half=0x%04X, is_blx=%d), LR=0x%08X\n",
+                           bl_count, cpu->r[15] - 4, target, second_half, is_blx, cpu->r[15] | 1);
+                    last_blx_target = target;
+                    bl_count++;
+                }
+                
+                // BL logging disabled - enable for debugging if needed
+                bl_count++;
+                
+                // Save return address in LR with bit 0 set (return to Thumb)
+                // R15 is now at: (current_instruction + 4) + 4 = current_instruction + 8
+                // Return address is: current_instruction + 4 (next instruction after this BL)
+                // So LR = (R15 - 4) | 1
+                cpu->r[14] = (cpu->r[15] - 4) | 1;
+                
+                // Branch to target
+                if (is_blx) {
+                    // BLX switches to ARM mode
+                    cpu->thumb_mode = false;
+                    cpu->r[15] = target & 0xFFFFFFFC;  // ARM addresses must be word-aligned
+                } else {
+                    // BL stays in Thumb mode
+                    cpu->thumb_mode = true;
+                    cpu->r[15] = target & 0xFFFFFFFE;
+                }
+                
+                return 3;
+            } else {
+                // Invalid BL/BLX sequence
+                return 1;
+            }
         } else {
-            // Second instruction: PC = LR + (offset << 1), LR = old PC | 1
-            u32 temp = cpu->r[15] - 2;
-            cpu->r[15] = (cpu->r[14] + (offset << 1)) & 0xFFFFFFFE;
-            cpu->r[14] = temp | 1;
+            // Orphaned second half
+            return 1;
         }
-        return 3;
     }
     
     // Unimplemented Thumb instruction
@@ -1288,13 +1661,365 @@ u32 cpu_step(ARM7TDMI *cpu, Memory *mem) {
     
     u32 pc = cpu->r[15];
     
+    // Detailed trace of stuck loop - DISABLED for performance
+    /*
+    static int loop_trace_count = 0;
+    u32 actual_pc = cpu->thumb_mode ? (pc - 4) : (pc - 8);
+    if (loop_trace_count < 200) {
+        u32 instr = cpu->thumb_mode ? mem_read16(mem, actual_pc) : mem_read32(mem, actual_pc);
+        printf("[TRACE %3d] PC=0x%08X %s I=0x%04X | R0=%08X R1=%08X R14=%08X SP=%08X\n",
+               loop_trace_count++, actual_pc, cpu->thumb_mode ? "T" : "A", instr,
+               cpu->r[0], cpu->r[1], cpu->r[14], cpu->r[13]);
+    }
+    */
+    
+    // Boot sequence - log first few instructions if needed for debugging
+    static int boot_instr_count = 0;
+    
+    // Trace main loop to understand what game is doing
+    static int main_loop_trace = 0;
+    static int trace_after_delay = 0;
+    static u64 global_instr_count = 0;
+    global_instr_count++;
+    
+    // Boot tracing disabled - enable for debugging if needed
+    /*
+    if (boot_instr_count < 50) {
+        u32 instr_addr = cpu->thumb_mode ? (pc - 4) : (pc - 8);
+        if ((cpu->thumb_mode && pc >= 4) || (!cpu->thumb_mode && pc >= 8)) {
+            u32 instr = cpu->thumb_mode ? mem_read16(mem, instr_addr) : mem_read32(mem, instr_addr);
+            printf("[BOOT %2d] R15=0x%08X | %s | I=0x%08X | R0=%08X R14=%08X\n",
+                   boot_instr_count, pc, cpu->thumb_mode ? "T" : "A", instr,
+                   cpu->r[0], cpu->r[14]);
+        }
+        boot_instr_count++;
+    }
+    */
+    
+    // Tracing disabled for performance
+    /*
+    // Skip early boot and trace specific loop area
+    if (trace_after_delay > 1000 && main_loop_trace < 200) {
+        u32 instr_addr = cpu->thumb_mode ? (pc - 4) : (pc - 8);
+        if ((cpu->thumb_mode && pc >= 4) || (!cpu->thumb_mode && pc >= 8)) {
+            u32 instr = cpu->thumb_mode ? mem_read16(mem, instr_addr) : mem_read32(mem, instr_addr);
+            printf("[TRACE %3d] PC=0x%08X | %s | I=0x%08X | R0=%08X R1=%08X R14=%08X | CPSR=%08X\n",
+                   main_loop_trace, pc, cpu->thumb_mode ? "T" : "A", instr,
+                   cpu->r[0], cpu->r[1], cpu->r[14], cpu->cpsr);
+            main_loop_trace++;
+        }
+    } else {
+        trace_after_delay++;
+    }
+    */
+    
+    if (boot_instr_count < 0) {
+        // Calculate instruction address
+        u32 instr_addr = cpu->thumb_mode ? (pc - 4) : (pc - 8);
+        
+        // Safety check: only read instruction if address is valid
+        // Skip trace for PC < 8/4 (would cause wraparound) but don't reset PC
+        if ((cpu->thumb_mode && pc >= 4) || (!cpu->thumb_mode && pc >= 8)) {
+            u32 instr = cpu->thumb_mode ? mem_read16(mem, instr_addr) : mem_read32(mem, instr_addr);
+            printf("[BOOT %4d] PC=0x%08X | %s | I=0x%08X | R0=%08X R1=%08X R13=%08X R14=%08X\n",
+                   boot_instr_count, pc, cpu->thumb_mode ? "T" : "A", instr,
+                   cpu->r[0], cpu->r[1], cpu->r[13], cpu->r[14]);
+        }
+        boot_instr_count++;
+        if (boot_instr_count == 100) {
+            printf("\n[BOOT] First 100 instructions complete, disabling trace\n");
+            printf("[BOOT] global_instr_count = %llu\n\n", global_instr_count);
+        }
+    }
+    
+    // Debug: detect stuck in specific loop
+    static u32 last_pc_check = 0;
+    static int pc_stuck_count = 0;
+    static int trace_stuck_loop = 0;
+    
+    // Detect if we're stuck at 0x082DFAF4 specifically (compiled ROM)
+    // OR at 0x08000496 (original ROM)
+    // Instruction is: CMP R4, #0; BNE -42  (loops while R4 != 0)
+    // The loop spans 0x082DFACA to 0x082DFAF4 (compiled ROM)
+    // OR 0x08000470 to 0x08000496 (original ROM - estimated)
+    static int consecutive_in_loop = 0;
+    bool in_compiled_loop = (pc >= 0x082DFACA && pc <= 0x082DFAF6);
+    bool in_original_loop = (pc >= 0x08000470 && pc <= 0x080004A0);
+    
+    if (in_compiled_loop || in_original_loop) {
+        consecutive_in_loop++;
+        
+        if (pc == 0x082DFAF4 || pc == 0x08000496) {
+            pc_stuck_count++;
+            if (pc_stuck_count <= 5 || (pc_stuck_count % 100000) == 0) {
+                printf("[DEBUG] Loop at 0x%08X, count=%d, consecutive=%d, R4=0x%08X (waiting for R4 == 0)\n", 
+                       pc, pc_stuck_count, consecutive_in_loop, cpu->r[4]);
+            }
+            if (consecutive_in_loop >= 3 && trace_stuck_loop == 0) {
+                printf("\n[STUCK LOOP] In loop for %d consecutive instructions at PC=0x%08X\n", consecutive_in_loop, pc);
+                printf("  R4=0x%08X (waiting for R4 to become ZERO)\n", cpu->r[4]);
+                printf("  R5=0x%08X\n", cpu->r[5]);
+                printf("  Will trace next 100 instructions...\n");
+                trace_stuck_loop = 100;
+            }
+        }
+        
+        // Trace when we're about to LOAD R4 (the instruction before the CMP in compiled ROM)
+        if (pc == 0x082DFAF0 || pc == 0x08000492) {
+            static int load_r4_count = 0;
+            if (load_r4_count < 10) {
+                // About to execute: LDR R4, [R4, #0x34] or similar
+                u32 base_addr = cpu->r[4];
+                printf("[R4 LOAD #%d] PC=0x%08X: R4=#0x%08X, R5=0x%08X\n",
+                       load_r4_count, pc, base_addr, cpu->r[5]);
+                load_r4_count++;
+            }
+        }
+    } else {
+        consecutive_in_loop = 0;
+        pc_stuck_count = 0;
+    }
+    
+    if (trace_stuck_loop > 0) {
+        if (cpu->thumb_mode && pc >= 4) {
+            u16 opcode = mem_read16(mem, pc - 4);
+            u32 z = (cpu->cpsr & FLAG_Z) ? 1 : 0;
+            u32 n = (cpu->cpsr & FLAG_N) ? 1 : 0;
+            u32 v = (cpu->cpsr & FLAG_V) ? 1 : 0;
+            u32 c = (cpu->cpsr & FLAG_C) ? 1 : 0;
+            
+            // Highlight R4 changes
+            static u32 last_r4 = 0;
+            const char* r4_marker = "";
+            if (cpu->r[4] != last_r4) {
+                r4_marker = " <-- R4 CHANGED!";
+                last_r4 = cpu->r[4];
+            }
+            
+            printf("[TRACE #%03d] PC=0x%08X opcode=0x%04X | R4=%08X R5=%08X | Z=%d N=%d%s\n",
+                   100 - trace_stuck_loop, pc - 4, opcode,
+                   cpu->r[4], cpu->r[5],
+                   z, n, r4_marker);
+        }
+        trace_stuck_loop--;
+    }
+    
+    // Check for misaligned PC in Thumb mode (critical bug detector)
+    if (cpu->thumb_mode && (pc & 1)) {
+        static int misalign_count = 0;
+        if (misalign_count < 5) {
+            printf("\n[CRITICAL] Misaligned PC in Thumb mode!\n");
+            printf("  PC=0x%08X (ODD address - should be EVEN in Thumb mode)\n", pc);
+            printf("  This will cause prefetch abort\n");
+            printf("  LR=0x%08X, CPSR=0x%08X\n", cpu->r[14], cpu->cpsr);
+            printf("  R0-R3: %08X %08X %08X %08X\n", cpu->r[0], cpu->r[1], cpu->r[2], cpu->r[3]);
+            misalign_count++;
+        }
+        // Fix it by masking off bit 0
+        cpu->r[15] = pc & 0xFFFFFFFE;
+        pc = cpu->r[15];
+    }
+    
+    // Validate CPSR mode bits (should be one of the valid ARM modes)
+    u32 mode = cpu->cpsr & 0x1F;
+    if (mode != 0x10 && mode != 0x11 && mode != 0x12 && mode != 0x13 && 
+        mode != 0x17 && mode != 0x1B && mode != 0x1F) {
+        // CPSR corrupted - reset to system mode
+        static int cpsr_log_count = 0;
+        if (cpsr_log_count < 3) {
+            printf("[CPSR CORRUPTION] Invalid mode 0x%02X in CPSR=0x%08X at PC=0x%08X\n", 
+                   mode, cpu->cpsr, pc);
+            printf("  R0-R3:  %08X %08X %08X %08X\n", cpu->r[0], cpu->r[1], cpu->r[2], cpu->r[3]);
+            printf("  R12-15: %08X %08X %08X %08X\n", cpu->r[12], cpu->r[13], cpu->r[14], cpu->r[15]);
+            printf("  SPSR:   %08X\n", cpu->spsr);
+            cpsr_log_count++;
+        }
+        cpu->cpsr = (cpu->cpsr & 0xFFFFFFE0) | 0x1F;  // System mode
+    }
+    
+    // Validate PC is in a valid memory region
+    // Valid: BIOS (0x0-0x3FFF), EWRAM (0x02000000+), IWRAM (0x03000000+), ROM (0x08000000+)
+    bool valid_pc = (pc < 0x4000) || 
+                    (pc >= 0x02000000 && pc < 0x04000000) ||
+                    (pc >= 0x08000000 && pc < 0x0E000000);
+    
+    if (!valid_pc) {
+        // PC is in invalid region
+        static u32 last_bad_pc = 0;
+        if (pc != last_bad_pc) {
+            printf("[PC CORRUPTION] Invalid PC=0x%08X, LR=0x%08X, resetting to ROM entry\n", 
+                   pc, cpu->r[14]);
+            printf("  R0-R3:  %08X %08X %08X %08X\n", cpu->r[0], cpu->r[1], cpu->r[2], cpu->r[3]);
+            printf("  R12-R15: %08X %08X %08X %08X\n", cpu->r[12], cpu->r[13], cpu->r[14], cpu->r[15]);
+            printf("  CPSR: %08X, Mode: %s\n", cpu->cpsr, cpu->thumb_mode ? "Thumb" : "ARM");
+            last_bad_pc = pc;
+        }
+        cpu->r[15] = 0x08000000;
+        cpu->thumb_mode = false;
+        return 3;
+    }
+    
+    // BIOS call detection and HLE
+    // If PC is in BIOS range (0x0000-0x3FFF) and not at an exception vector
+    if (pc < 0x4000 && pc >= 0x20) {
+        // Game is trying to execute BIOS code directly
+        // This happens when games do BX to BIOS addresses or exceptions occur
+        
+        // Exception vectors that might be hit:
+        // 0x00: Reset, 0x04: Undefined, 0x08: SWI, 0x0C: Prefetch abort,
+        // 0x10: Data abort, 0x18: IRQ, 0x1C: FIQ
+        
+        if (pc >= 0x04 && pc < 0x20) {
+            // Exception occurred - log it once
+            static u32 last_exception_pc = 0;
+            if (pc != last_exception_pc) {
+                const char *exc_name[] = {"UND", "SWI", "PRE", "DAT", "RES", "RES", "IRQ", "FIQ"};
+                printf("[EXCEPTION] %s at vector 0x%02X, LR=0x%08X, CPSR=0x%08X\n", 
+                       exc_name[(pc-4)/4], pc, cpu->r[14], cpu->cpsr);
+                last_exception_pc = pc;
+            }
+        }
+        
+        // We handle this by returning to the caller (in LR)
+        if (cpu->r[14] >= 0x08000000) {
+            // Valid return address in ROM - return there
+            cpu->thumb_mode = cpu->r[14] & 1;
+            u32 target = cpu->r[14] & 0xFFFFFFFE;
+            cpu->r[15] = target + (cpu->thumb_mode ? 4 : 8);
+            return 3;
+        } else {
+            // No valid return address - jump to ROM entry point
+            cpu->r[15] = 0x08000000 + 8;  // ARM mode, so PC = target + 8
+            cpu->thumb_mode = false;
+            return 3;
+        }
+    }
+    
+    // Debug tracing if enabled
+    if (debug_should_trace(pc)) {
+        // Safety check for wraparound
+        if ((cpu->thumb_mode && pc >= 4) || (!cpu->thumb_mode && pc >= 8)) {
+            if (cpu->thumb_mode) {
+                u16 opcode = mem_read16(mem, pc - 4);
+                debug_trace_instruction(pc - 4, opcode, true, "");
+            } else {
+                u32 opcode = mem_read32(mem, pc - 8);
+                debug_trace_instruction(pc - 8, opcode, false, "");
+            }
+        }
+    }
+    
+    // Special handling for PC at BIOS exception vectors (0x00-0x1C)
+    // Log when game tries to jump to BIOS vectors to understand why
+    if (pc >= 0 && pc <= 0x1C) {
+        static int bx_to_bios_count = 0;
+        static u32 last_vector_pc = 0xFFFFFFFF;
+        if (pc != last_vector_pc || bx_to_bios_count < 10) {
+            const char* vector_name = "Unknown";
+            if (pc == 0x00) vector_name = "Reset";
+            else if (pc == 0x04) vector_name = "Undefined Instruction";
+            else if (pc == 0x08) vector_name = "Prefetch Abort";
+            else if (pc == 0x0C) vector_name = "Data Abort";
+            else if (pc == 0x18) vector_name = "IRQ";
+            
+            printf("\n[BIOS VECTOR 0x%02X - %s] Exception occurred!\n", (unsigned int)pc, vector_name);
+            printf("  Previous PC was: 0x%08X\n", pc - (cpu->thumb_mode ? 4 : 8));
+            printf("  Return address: LR=0x%08X (instruction that caused exception)\n", cpu->r[14]);
+            printf("  CPSR=0x%08X, Mode=%s, Thumb=%d\n",
+                   cpu->cpsr, cpu->thumb_mode ? "T" : "A", cpu->thumb_mode);
+            printf("  R0-R3: %08X %08X %08X %08X\n", cpu->r[0], cpu->r[1], cpu->r[2], cpu->r[3]);
+            
+            // For prefetch abort, LR points to the instruction that failed + offset
+            if (pc == 0x08 && cpu->r[14] >= 0x08000000) {
+                u32 failed_pc = cpu->r[14] - 4;
+                printf("  Failed PC: 0x%08X (attempted to fetch instruction from here)\n", failed_pc);
+                // Try to read what was there
+                if (failed_pc >= 0x08000000 && failed_pc < 0x0A000000) {
+                    u16 instr = mem_read16(mem, failed_pc);
+                    printf("  Instruction bytes at failed PC: 0x%04X\n", instr);
+                }
+            }
+            printf("      R0=%08X R1=%08X R2=%08X R3=%08X\n",
+                   cpu->r[0], cpu->r[1], cpu->r[2], cpu->r[3]);
+            bx_to_bios_count++;
+            last_vector_pc = pc;
+        }
+        if (pc >= 0 && pc <= 0x10) {  // Exception vectors that should loop
+            // Exception occurred (Reset, Undefined, SWI, Prefetch/Data Abort)
+            // For prefetch abort (0x08), LR = failed instruction + 4
+            // For data abort (0x0C), LR = failed instruction + 8
+            // We should NOT retry the failed instruction - skip it!
+            
+            if (pc == 0x08) {
+                // Prefetch abort - skip the problematic instruction
+                // LR already points to next instruction (failed + 4)
+                if (cpu->r[14] >= 0x08000000) {
+                    // Debug: understand the prefetch abort addresses
+                    static int pf_debug_count = 0;
+                    if (pf_debug_count < 3) {
+                        u32 lr = cpu->r[14];
+                        // For Thumb: LR = (failed_instruction + 4) | 1
+                        // So failed_instruction = (LR & ~1) - 4
+                        u32 failed_addr = (lr & 0xFFFFFFFE) - 4;
+                        printf("[BIOS] Prefetch abort #%d: LR=0x%08X, failed_addr=0x%08X\n", 
+                               pf_debug_count, lr, failed_addr);
+                        printf("      Current PC=0x%08X, Thumb=%d, CPSR=0x%08X\n",
+                               cpu->r[15], cpu->thumb_mode, cpu->cpsr);
+                        printf("      R0=%08X R1=%08X R2=%08X R3=%08X\n",
+                               cpu->r[0], cpu->r[1], cpu->r[2], cpu->r[3]);
+                        printf("      LR bit0=%d, failed_addr bit0=%d\n",
+                               lr & 1, failed_addr & 1);
+                        
+                        u32 problematic_pc = failed_addr;
+                        if (failed_addr & 1) {
+                            printf("      !!! PROBLEM: Tried to fetch instruction from ODD address 0x%08X !!!\n", problematic_pc);
+                            printf("      This means R15 was set to 0x%08X (odd!), which is invalid\n", problematic_pc + 4);
+                        } else {
+                            printf("      Failed to fetch instruction from EVEN address 0x%08X\n", problematic_pc);
+                            printf("      This might be an unmapped/invalid memory region\n");
+                        }
+                        
+                        pf_debug_count++;
+                    }
+                    
+                    // Extract Thumb mode from LR bit 0
+                    cpu->thumb_mode = cpu->r[14] & 1;
+                    // Set PC with pipeline offset: R15 = target + (thumb ? 4 : 8)
+                    u32 target = cpu->r[14] & 0xFFFFFFFE;
+                    cpu->r[15] = target + (cpu->thumb_mode ? 4 : 8);
+                    
+                    // Verbose prefetch logging disabled
+                    // Enable for debugging if needed
+                    return 3;
+                }
+            }
+            
+            // For other exceptions, try to return to LR
+            if (cpu->r[14] >= 0x08000000) {
+                // Valid return address in ROM - return there
+                cpu->thumb_mode = cpu->r[14] & 1;
+                u32 target = cpu->r[14] & 0xFFFFFFFE;
+                cpu->r[15] = target + (cpu->thumb_mode ? 4 : 8);
+                return 3;
+            } else {
+                // No valid LR - jump to ROM entry
+                cpu->r[15] = 0x08000000 + 8;  // ARM mode, so PC = target + 8
+                cpu->thumb_mode = false;
+                return 3;
+            }
+        } else {
+            // IRQ/FIQ vectors at 0x18/0x1C - let them execute normally
+            // Fall through to normal ARM execution
+        }
+    }
+    
     if (cpu->thumb_mode) {
-        u16 opcode = mem_read16(mem, pc);
-        cpu->r[15] += 2;
+        u16 opcode = mem_read16(mem, pc - 4);  // Fetch from actual instruction address
+        cpu->r[15] += 2;  // Increment PC before execution (pipeline)
         return execute_thumb(cpu, mem, opcode);
     } else {
-        u32 opcode = mem_read32(mem, pc);
-        cpu->r[15] += 4;
+        u32 opcode = mem_read32(mem, pc - 8);  // Fetch from actual instruction address
+        cpu->r[15] += 4;  // Increment PC before execution (pipeline)
         return execute_arm(cpu, mem, opcode);
     }
 }

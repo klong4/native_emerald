@@ -15,6 +15,14 @@ static void dma_execute(DMAChannel *dma, Memory *mem) {
     u32 dst = dma->internal_dest;
     u16 count = dma->internal_count;
     
+    // Log DMA execution
+    static int dma_log_count = 0;
+    if (dma_log_count < 10) {
+        printf("[DMA] Executing: src=0x%08X → dst=0x%08X, count=%d, %s\n",
+               src, dst, count, dma->word_transfer ? "32-bit" : "16-bit");
+        dma_log_count++;
+    }
+    
     if (count == 0) {
         count = (dma - (DMAChannel*)0 == 3) ? 0x10000 : 0x4000; // Max count
     }

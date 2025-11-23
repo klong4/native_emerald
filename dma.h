@@ -3,6 +3,9 @@
 
 #include "types.h"
 
+// Forward declaration (Memory is defined in memory.h)
+typedef struct Memory_s Memory;
+
 // DMA registers (each channel has 12 bytes)
 #define REG_DMA0SAD   0xB0  // Source address
 #define REG_DMA0DAD   0xB4  // Destination address
@@ -42,9 +45,7 @@
 #define DMA_DST_FIX     0x0080
 #define DMA_DST_RELOAD  0x00C0
 
-typedef struct Memory Memory;
-
-typedef struct {
+typedef struct DMAChannel {
     u32 source;
     u32 dest;
     u16 count;
@@ -58,7 +59,7 @@ typedef struct {
     u16 internal_count;
 } DMAChannel;
 
-typedef struct {
+typedef struct DMAState {
     DMAChannel channels[4];
 } DMAState;
 
